@@ -139,4 +139,4 @@ if st.button("🚀 Jana Laporan Final Excel", type="primary", use_container_widt
         # --- Debug expander (always shown after processing) ---
         if debug_lines:
             with st.expander("🔍 Debug: 40 baris pertama PDF Kehadiran (untuk semak format)"):
-                st.code("\n".join(debug_lines), language=None)
+                st.text("\n".join(debug_lines))
