@@ -171,10 +171,10 @@ _RE_STATUS_CONT = re.compile(r'^(Good|Time|Early)\)$', re.IGNORECASE)
 _RE_HOURS       = re.compile(r'^\d{2}:\d{2}:\d{2}\s+\d+:\d{2}:\d{2}\s+\d+:\d{2}:\d{2}$')
 _RE_ROW_DEFAULT = re.compile(r'^(\d{1,2})\s+Default$')
 _RE_ROW_FULL    = re.compile(r'^(\d{1,2})\s+Default\s+Shift$')
-_RE_EMP_NAME    = re.compile(r'Employee Name\s*[:\s|]\s*(.+)', re.IGNORECASE)
+_RE_EMP_NAME    = re.compile(r'Employee\s+Name\s*[:\s|]\s*(.+)', re.IGNORECASE)
 _RE_SKIP        = re.compile(
     r'^(NO\s+SHIFT|ATTENDANCE\s+TIMESHEET|SHIFT\s+DATETIME|BREAK\s+HOUR|'
-    r'Date\s+Generated|Name\s*:|Division$)',
+    r'Date\s+Generated|Name\s*:|Division\b|Analytic\s+Division)',
     re.IGNORECASE
 )
 
@@ -337,7 +337,30 @@ def parse_department_pdf(pdf_bytes):
     """
     reader    = pypdf.PdfReader(io.BytesIO(pdf_bytes))
     full_text = "\n".join([page.extract_text() for page in reader.pages])
-    all_lines = [l.strip() for l in full_text.split("\n")]
+    raw_lines = [l.strip() for l in full_text.split("\n")]
+
+    # Pre-process: PDF sometimes splits "Employee Name" across two lines:
+    #   Line N  : "Employee"
+    #   Line N+1: "Name :AIMI AYUNI ABDUL JAMIL"
+    # Merge them into "Employee Name :AIMI AYUNI ABDUL JAMIL" so _RE_EMP_NAME matches.
+    all_lines = []
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+        if line.lower() == "employee" and i + 1 < len(raw_lines):
+            nxt = raw_lines[i + 1].strip()
+            if re.match(r'^name\s*[:\|]', nxt, re.IGNORECASE):
+                all_lines.append(f"Employee {nxt}")
+                i += 2
+                continue
+        # Skip standalone "Department" / "Name :Dept..." lines (not employee names)
+        if line.lower() == "department" and i + 1 < len(raw_lines):
+            nxt = raw_lines[i + 1].strip()
+            if re.match(r'^name\s*[:\|]', nxt, re.IGNORECASE):
+                i += 2   # skip both lines
+                continue
+        all_lines.append(line)
+        i += 1
 
     # Split baris kepada segmen per pekerja menggunakan penanda "Employee Name"
     segments = []   # list of (raw_name, [lines])
