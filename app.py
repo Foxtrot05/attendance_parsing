@@ -13,7 +13,9 @@ st.write("Sistem ini akan mencantumkan kehadiran staf individu, rekod cuti syari
 # Pilihan Bulan & Tahun
 c_year, c_month = st.columns(2)
 with c_year:
-    selected_year = st.selectbox("Tahun", [2025, 2026, 2027], index=1)
+    years = list(range(2025, 2031))
+    default_year = datetime.now().year if datetime.now().year in years else years[0]
+    selected_year = st.selectbox("Tahun", years, index=years.index(default_year))
 with c_month:
     selected_month = st.selectbox(
         "Bulan",
@@ -47,6 +49,13 @@ with col3:
         "Muat naik fail Timeslip/Time-Off (boleh pilih banyak jabatan)",
         type=["pdf"],
         accept_multiple_files=True
+    )
+
+with st.expander("⚙️ Pilihan Tambahan (Cuti Umum)"):
+    holiday_text = st.text_area(
+        "Cuti Umum (satu tarikh setiap baris, format DD/MM/YYYY)",
+        value=f"25/12/{selected_year}",
+        help="Tarikh ini akan ditanda 'PH' dan dikira dalam lajur PUBLIC LEAVE."
     )
 
 st.divider()
@@ -87,12 +96,22 @@ if st.button("🚀 Jana Laporan Final Excel", type="primary", use_container_widt
                 except Exception as de:
                     debug_lines = [f"[Gagal baca PDF preview: {de}]"]
 
-                # 4. Parse employees
+                # 4. Parse employees (once; reused by the engine)
                 all_employees = []
                 for b in att_bytes_list:
-                    emps = parse_department_pdf(b)
-                    all_employees.extend(emps)
+                    all_employees.extend(parse_department_pdf(b))
                 result_count = len(all_employees)
+
+                # Public holidays & manual notes
+                holidays = set()
+                for ln in holiday_text.splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        holidays.add(datetime.strptime(ln, "%d/%m/%Y").date())
+                    except ValueError:
+                        raise ValueError(f"Format tarikh cuti umum tidak sah: '{ln}' (guna DD/MM/YYYY)")
 
                 # 5. Generate Excel
                 excel_bytes = generate_reconciled_excel(
@@ -100,7 +119,9 @@ if st.button("🚀 Jana Laporan Final Excel", type="primary", use_container_widt
                     leave_pdf_bytes=leave_bytes,
                     timeoff_pdf_list=timeoff_bytes_list,
                     year=selected_year,
-                    month=selected_month
+                    month=selected_month,
+                    public_holidays=holidays,
+                    employees_list=all_employees
                 )
 
                 month_name  = datetime(selected_year, selected_month, 1).strftime('%B')

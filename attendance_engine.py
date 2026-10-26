@@ -20,6 +20,42 @@ def normalize_name(name):
     return " ".join(name.split())
 
 
+def names_match(a, b):
+    """Exact match, or one name's tokens fully contained in the other's (min 2 tokens)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ta, tb = set(a.split()), set(b.split())
+    small, big = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(small) >= 2 and small <= big:
+        return True
+    # PDFs sometimes glue words together (e.g. "MOHDRAZI"): compare without spaces
+    ca, cb = a.replace(" ", ""), b.replace(" ", "")
+    if ca == cb:
+        return True
+    short, long_ = (ca, cb) if len(ca) <= len(cb) else (cb, ca)
+    return len(short) >= 12 and short in long_
+
+
+def parse_manual_notes(text):
+    """
+    Parse manual notes, one per line: NAME | DD/MM/YYYY | NOTE  (e.g. WFH, LUPA OUT).
+    Returns list of {norm_name, date, note}.
+    """
+    records = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 3:
+            continue
+        try:
+            d = datetime.strptime(parts[1], "%d/%m/%Y").date()
+        except ValueError:
+            continue
+        records.append({"norm_name": normalize_name(parts[0]), "date": d, "note": parts[2]})
+    return records
+
+
 # Mapping postcode → nama bandar ringkas
 POSTCODE_CITY_MAP = {
     "71800": "NILAI",    "71700": "MANTIN",   "71450": "REMBAU",
@@ -43,7 +79,7 @@ def clean_location(loc_str):
     # Buang Google Plus Code (cth: RQGX+2J) dari awal string
     loc_clean = re.sub(r'^[A-Z0-9]{4,8}\+[A-Z0-9]{2,4}\s*,?\s*', '', loc_str, flags=re.IGNORECASE).strip()
     # Cuba cari postcode dan map ke nama bandar
-    postcode_match = re.search(r'\b(\d{5})\b', loc_clean)
+    postcode_match = re.search(r'(?<!\d)(\d{5})(?!\d)', loc_clean)
     if postcode_match:
         pc = postcode_match.group(1)
         if pc in POSTCODE_CITY_MAP:
@@ -79,7 +115,7 @@ def parse_time(time_str):
 def fmt_time(ts):
     try:
         t_obj = datetime.strptime(ts.strip(), "%I:%M %p")
-        return t_obj.strftime("%-I:%M %p")   # Linux: %-I buang leading zero
+        return t_obj.strftime("%I:%M %p").lstrip("0")   # portable (Windows & Linux)
     except Exception:
         return ts.strip()
 
@@ -119,7 +155,7 @@ def parse_all_department_leaves(pdf_bytes):
     pattern = re.compile(
         r'(\d+)\s+([A-Z\s\.\@\?]+?)\s+(Annual Leave|Replacement Leave|Medical Leave|'
         r'Compassionate Leave[^\n]*|Special Leave[^\n]*|Cuti [^\n]*)\s+'
-        r'(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+([\d\.]+)\s+.*?(Approved|Cancelled)',
+        r'(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})\s+([\d\.]+)\s+[\s\S]*?(Approved|Cancelled)',
         re.IGNORECASE
     )
     for match in pattern.finditer(text):
@@ -151,10 +187,12 @@ def parse_multiple_timeoff_records(timeoff_bytes_list):
         text = "\n".join([page.extract_text() for page in reader.pages])
         for match in pattern.finditer(text):
             name, date_str, s_time, e_time = match.groups()
+            s_clean = re.sub(r'\s', '', s_time)
+            e_clean = re.sub(r'\s', '', e_time)
             timeoff_records.append({
                 "norm_name": normalize_name(name),
                 "date":      datetime.strptime(date_str, "%d/%m/%Y").date(),
-                "time_str":  f"TIME SLIP {s_time.replace(' ', '')}-{e_time.replace(' ', '')}".replace(":00", "")
+                "time_str":  f"TIME SLIP {s_clean}-{e_clean}".replace(":00", "")
             })
     return timeoff_records
 
@@ -201,11 +239,65 @@ def _flush_record(cur, days_record):
         pass
 
 
+# --- Regex-based row parser (layout sebenar PDF: satu baris rekod dalam satu
+#     baris teks, alamat boleh dibungkus ke beberapa baris) ---
+_RE_ROW_SPLIT = re.compile(r'(?<![\d/:])\d{1,3}\s+Default\s*Shift\b', re.IGNORECASE)
+_RE_DT        = re.compile(r'(\d{2}/\d{2}/\d{4})\s*(\d{1,2}:\d{2})\s*([AP]M)', re.IGNORECASE)
+_RE_STAT_INL  = re.compile(r'\s*\([^)]*\)')
+_RE_HOURS_INL = re.compile(r'\d{1,2}:\d{2}:\d{2}\s+\d+:\d{2}:\d{2}\s+\d+:\d{2}:\d{2}')
+
+
+def _parse_rows_regex(lines):
+    text   = " ".join(l for l in lines if l)
+    text   = re.sub(r'\s+', ' ', text)
+    text   = re.sub(r'ATTENDANCE TIMESHEET REPORT.*?Date Generated\s*:\s*\d{2}/\d{2}/\d{4}', ' ', text, flags=re.I)
+    text   = re.sub(r'NO SHIFT DATETIME IN.*?ACTUAL WORKING HOUR', ' ', text, flags=re.I)
+    starts = [m.end() for m in _RE_ROW_SPLIT.finditer(text)]
+    ends   = [m.start() for m in _RE_ROW_SPLIT.finditer(text)][1:] + [len(text)]
+    days_record = {}
+    for s, e in zip(starts, ends):
+        chunk = text[s:e]
+        m1 = _RE_DT.search(chunk)
+        if not m1:
+            continue
+        pos = m1.end()
+        st  = _RE_STAT_INL.match(chunk, pos)
+        if st:
+            pos = st.end()
+        m2 = _RE_DT.search(chunk, pos)
+        if not m2:
+            continue
+        loc_in = chunk[pos:m2.start()].strip()
+        pos2   = m2.end()
+        st2    = _RE_STAT_INL.match(chunk, pos2)
+        if st2:
+            pos2 = st2.end()
+        hrs     = _RE_HOURS_INL.search(chunk, pos2)
+        loc_out = chunk[pos2:hrs.start()].strip() if hrs else chunk[pos2:].strip()
+        _flush_record({
+            "d_in":  m1.group(1), "t_in":  f"{m1.group(2)} {m1.group(3).upper()}",
+            "d_out": m2.group(1), "t_out": f"{m2.group(2)} {m2.group(3).upper()}",
+            "loc_in": loc_in, "loc_out": loc_out,
+        }, days_record)
+    return days_record
+
+
 def _run_state_machine(lines, raw_name):
     """
-    Jalankan state machine pada senarai baris untuk satu pekerja.
+    Parse rekod satu pekerja. Cuba regex parser dahulu; jika tiada rekod,
+    guna state machine lama (format PDF berbaris-baris).
     Return dict: {norm_name, raw_name, records, notes, timeoff_notes}
     """
+    regex_records = _parse_rows_regex(lines)
+    if regex_records:
+        return {
+            "norm_name":     normalize_name(raw_name),
+            "raw_name":      raw_name,
+            "records":       regex_records,
+            "notes":         {},
+            "timeoff_notes": {},
+        }
+
     days_record   = {}
     notes_dict    = {}
     timeoff_notes = {}
@@ -386,11 +478,19 @@ def parse_department_pdf(pdf_bytes):
     if cur_name is not None:
         segments.append((cur_name, cur_lines))
 
-    # Parse setiap segmen
-    employees = []
+    # Gabungkan segmen bagi pekerja yang sama (header nama berulang setiap muka surat)
+    merged = {}
     for raw_name, seg_lines in segments:
-        emp = _run_state_machine(seg_lines, raw_name)
-        employees.append(emp)
+        key = normalize_name(raw_name) or raw_name
+        if key in merged:
+            merged[key][1].extend(seg_lines)
+        else:
+            merged[key] = (raw_name, list(seg_lines))
+
+    # Parse setiap pekerja
+    employees = []
+    for raw_name, seg_lines in merged.values():
+        employees.append(_run_state_machine(seg_lines, raw_name))
 
     return employees
 
@@ -410,11 +510,16 @@ def parse_single_individual_pdf(pdf_bytes):
 # ---------------------------------------------------------------------------
 
 def generate_reconciled_excel(attendance_pdf_list, leave_pdf_bytes,
-                               timeoff_pdf_list=None, year=2025, month=12):
-    # 1. Parse Data
-    employees_list = []
-    for pdf_b in attendance_pdf_list:
-        employees_list.extend(parse_department_pdf(pdf_b))
+                               timeoff_pdf_list=None, year=2025, month=12,
+                               public_holidays=None, manual_notes=None,
+                               employees_list=None):
+    # 1. Parse Data (reuse pre-parsed employees if supplied)
+    if employees_list is None:
+        employees_list = []
+        for pdf_b in attendance_pdf_list:
+            employees_list.extend(parse_department_pdf(pdf_b))
+    public_holidays = set(public_holidays or [])
+    manual_notes    = manual_notes or []
 
     leave_list   = parse_all_department_leaves(leave_pdf_bytes)
     timeoff_list = parse_multiple_timeoff_records(timeoff_pdf_list) if timeoff_pdf_list else []
@@ -458,18 +563,27 @@ def generate_reconciled_excel(attendance_pdf_list, leave_pdf_bytes,
 
         cnt_wfh, cnt_leave, cnt_mc, cnt_timeoff = 0, 0.0, 0.0, 0
         cnt_not_in, cnt_not_out, cnt_early, cnt_late = 0, 0, 0, 0
+        cnt_unpaid, cnt_public = 0.0, 0
 
-        staf_leaves   = [l for l in leave_list
-                         if l["norm_name"] in norm_emp or norm_emp in l["norm_name"]]
+        staf_leaves   = [l for l in leave_list if names_match(l["norm_name"], norm_emp)]
         staf_timeoffs = {to["date"]: to["time_str"] for to in timeoff_list
-                         if to["norm_name"] in norm_emp or norm_emp in to["norm_name"]}
+                         if names_match(to["norm_name"], norm_emp)}
+        staf_notes    = {}
+        for mn in manual_notes:
+            if names_match(mn["norm_name"], norm_emp):
+                staf_notes[mn["date"]] = (staf_notes.get(mn["date"], "") + " " + mn["note"]).strip()
 
         for day in range(1, num_days + 1):
             curr_date = datetime(year, month, day).date()
             weekday   = curr_date.weekday()
             col_idx   = day + 1
 
-            if weekday in [5, 6] or (month == 12 and day == 25):
+            if weekday in [5, 6]:
+                ws.cell(row=row_idx, column=col_idx).fill = fill_weekend
+                continue
+            if curr_date in public_holidays:
+                row_cells[day] = "PH"
+                cnt_public += 1
                 ws.cell(row=row_idx, column=col_idx).fill = fill_weekend
                 continue
 
@@ -478,9 +592,13 @@ def generate_reconciled_excel(attendance_pdf_list, leave_pdf_bytes,
             for lv in staf_leaves:
                 if lv["start_date"].date() <= curr_date <= lv["end_date"].date():
                     is_on_leave = True
-                    if "medical" in lv["type"].lower():
+                    lt = lv["type"].lower()
+                    if "medical" in lt:
                         cnt_mc += 1
                         row_cells[day] = "MC"
+                    elif "unpaid" in lt or "tanpa gaji" in lt:
+                        cnt_unpaid += 1 if lv["days"] >= 1 else 0.5
+                        row_cells[day] = "UNPAID"
                     else:
                         cnt_leave += 1 if lv["days"] >= 1 else 0.5
                         row_cells[day] = "CUTI"
@@ -490,11 +608,13 @@ def generate_reconciled_excel(attendance_pdf_list, leave_pdf_bytes,
                 continue
 
             rec       = emp_info["records"].get(day)
-            note      = emp_info["notes"].get(curr_date, "")
+            note      = (emp_info["notes"].get(curr_date, "") + " " + staf_notes.get(curr_date, "")).strip()
             timeoff_str = staf_timeoffs.get(curr_date) or emp_info["timeoff_notes"].get(curr_date)
 
             if not rec:
-                row_cells[day] = "TIADA REKOD"
+                row_cells[day] = ("WFH\n" if "wfh" in note.lower() else "") + "TIADA REKOD"
+                if "wfh" in note.lower():
+                    cnt_wfh += 1
                 cnt_not_in    += 1
                 ws.cell(row=row_idx, column=col_idx).fill = fill_red
                 continue
@@ -539,8 +659,8 @@ def generate_reconciled_excel(attendance_pdf_list, leave_pdf_bytes,
         row_cells[m_idx + 1]  = cnt_leave   if cnt_leave   > 0 else None
         row_cells[m_idx + 2]  = cnt_mc      if cnt_mc      > 0 else None
         row_cells[m_idx + 3]  = cnt_timeoff if cnt_timeoff > 0 else None
-        row_cells[m_idx + 4]  = None
-        row_cells[m_idx + 5]  = None
+        row_cells[m_idx + 4]  = cnt_unpaid  if cnt_unpaid  > 0 else None
+        row_cells[m_idx + 5]  = cnt_public  if cnt_public  > 0 else None
         row_cells[m_idx + 6]  = cnt_not_in  if cnt_not_in  > 0 else None
         row_cells[m_idx + 7]  = get_status_label(cnt_not_in)
         row_cells[m_idx + 8]  = cnt_not_out if cnt_not_out > 0 else None
